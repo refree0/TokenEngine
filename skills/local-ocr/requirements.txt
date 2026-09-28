@@ -1,0 +1,3 @@
+# 本地 OCR（PaddleOCR PP-OCR 模型的 ONNX 版）
+# 会自动带上 onnxruntime / opencv-python / numpy / Pillow / shapely / pyclipper 等依赖
+rapidocr_onnxruntime

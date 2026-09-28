@@ -1,0 +1,40 @@
+# ============================================================
+#  TokenEngine .gitignore
+#  原则：凡含明文密钥 / 本机路径 / 运行态数据的，一律不入库
+# ============================================================
+
+# ---------- 密钥与本地配置（最重要）----------
+config/providers.json
+config/*.bak_*
+config/*.bak2_*
+config/watchdog_registry.json
+
+# ---------- 备份文件 ----------
+*.bak
+*.bak_*
+*.bak2_*
+router.py.bak*
+
+# ---------- 日志与运行态 ----------
+logs/
+*.log
+
+# ---------- Python ----------
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+env/
+
+# ---------- 编辑器 / 系统 ----------
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# ---------- 临时文件 ----------
+tmp/
+*.tmp
+*~
