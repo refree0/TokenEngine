@@ -14,6 +14,8 @@ config/watchdog_registry.json
 # 且走的是 Antigravity 客户端内嵌 client_id 直连 Google 内部 API 的非官方用法；
 # 一旦外泄只能靠重新登录作废，也可能触发账号风控。
 antigravity_shim.py
+antigravity_accounts.py
+test_shim_accounts.py
 start_supervisor.vbs
 watchdog_registry.json
 
