@@ -9,6 +9,14 @@ config/*.bak_*
 config/*.bak2_*
 config/watchdog_registry.json
 
+# ---------- 本机专属桥接件（双版本原则，绝不能进公开仓库）----------
+# antigravity_shim.py 会读 Google 凭据管理器里的 refresh_token（等价长期登录态），
+# 且走的是 Antigravity 客户端内嵌 client_id 直连 Google 内部 API 的非官方用法；
+# 一旦外泄只能靠重新登录作废，也可能触发账号风控。
+antigravity_shim.py
+start_supervisor.vbs
+watchdog_registry.json
+
 # ---------- 备份文件 ----------
 *.bak
 *.bak_*

@@ -110,12 +110,20 @@ def main():
         check("7. Vision 识图", True, f"跳过（找不到 {CARD}）")
 
     # 8. 显式路由 provider:model
-    s, b, h = post("/v1/chat/completions",
-                   {"model": "bailian:auto",
-                    "messages": [{"role": "user", "content": "reply: OK6"}], "max_tokens": 10})
-    check("8. 显式路由 bailian:auto", s == 200 and h.get("x-tokenengine-provider") == "bailian",
-          f"HTTP {s} provider={h.get('x-tokenengine-provider')} "
-          f"model={h.get('x-tokenengine-model')}")
+    #    ⚠️ 不要钉死某一个源：免费源会因额度耗尽 / 模型被暂停而临时不可用
+    #    （bailian 免费额度耗尽、volcengine 模型暂停都会让固定断言随机失败）。
+    #    按可用性顺序依次试，命中「200 且 x-tokenengine-provider 等于指定源」即算通过。
+    _got, _p8, _last8 = None, "", ""
+    for _m8 in ("amd:auto", "antigravity:auto", "sensenova:auto", "modelscope:auto"):
+        _p8 = _m8.split(":")[0]
+        s, b, h = post("/v1/chat/completions",
+                       {"model": _m8, "messages": [{"role": "user", "content": "reply: OK6"}],
+                        "max_tokens": 10})
+        _got = h.get("x-tokenengine-provider")
+        _last8 = f"{_m8} -> HTTP {s} provider={_got} model={h.get('x-tokenengine-model')}"
+        if s == 200 and _got == _p8:
+            break
+    check("8. 显式路由 provider:model", s == 200 and _got == _p8, _last8)
 
     # 9. 思考模式：流式 delta 必须透传 reasoning_content
     #    （否则客户端下一轮无法回传，上游报 400 "reasoning content must be passed back"）
@@ -154,6 +162,145 @@ def main():
               f"{len(acc)} 个 provider 池")
     except Exception as e:
         check("10. /health 账号池", False, str(e)[:60])
+
+    # 11. 超长请求：所有源都装不下时返回明确错误，且不再挨个砸小窗口源
+    #     （打卡·下一步行动 第 1 条。旧逻辑 `if fitted:` 失效后原样放行，
+    #      把超长请求挨个砸进 16k 窗口的 bigmodel，白撞 400 + 白等 N 轮往返，
+    #      压力测试里 55 次超窗 400 都这么来的。现在只挑窗口最大的那一个试一次。）
+    #     走单元级验证而非真请求：amd 实测能吞下 43 万 token，真请求触发不了
+    #     「所有源都装不下」这条分支，而且 3.5MB 上传要跑两分钟。
+    try:
+        import router as _r
+        _huge = "a" * 3_500_000          # est ≈110 万 token > 所有 context_window（最大 1M）
+        _msgs = [{"role": "user", "content": _huge}]
+        _tried = []
+        _orig = (_r._try_provider, _r.log_line)
+        _r._try_provider = lambda p, *a, **k: (_tried.append(p["name"]), (None, None, "boom"))[1]
+        _r.log_line = lambda *a, **k: None
+        try:
+            _j, _p, _e = _r.chat_call(_msgs, model="auto", max_tokens=1)
+        finally:
+            (_r._try_provider, _r.log_line) = _orig
+        check("11. 超长请求明确报错",
+              _j is None and "request too large" in (_e or "") and len(_tried) == 1,
+              f"只试了 {_tried}（旧逻辑会试全部），错误含request_too_large="
+              f"{'request too large' in (_e or '')}")
+    except Exception as e:
+        check("11. 超长请求明确报错", False, f"{type(e).__name__}: {str(e)[:70]}")
+
+    # 12. 截断空内容自动重试（打卡·下一步行动 第 1 条）
+    #     单元级验证「finish_reason=length + 空内容 → 同源放宽 max_tokens 重试一次」的接线：
+    #     伪造 opener 让第一次返回空内容，断言 _retry_truncated 被调用且结果被采纳。
+    try:
+        import router as _r
+
+        class _FakeResp:
+            def __init__(self, obj):
+                self._b = json.dumps(obj).encode()
+
+            def read(self):
+                return self._b
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *a):
+                return False
+
+        class _FakeOpener:
+            def open(self, rq, timeout=None):
+                return _FakeResp({"choices": [{"index": 0, "finish_reason": "length",
+                                               "message": {"role": "assistant", "content": ""}}],
+                                  "model": "m1", "usage": {}})
+
+        _seen = {}
+        _orig = (_r.opener_for, _r._retry_truncated, _r.mark_fail, _r.set_cooldown,
+                 _r.state_save, _r.log_line)
+        _r.opener_for = lambda p: _FakeOpener()
+
+        def _fake_retry(p, real_model, use_key, messages, tools, max_tokens, extra, timeout, want):
+            _seen["called"] = (real_model, max_tokens)
+            return {"choices": [{"index": 0, "finish_reason": "stop",
+                                 "message": {"role": "assistant", "content": "正文"}}],
+                    "model": real_model, "usage": {}}
+
+        _r._retry_truncated = _fake_retry
+        _r.mark_fail = lambda *a, **k: None          # 别污染 fail.log / LIVE
+        _r.set_cooldown = lambda *a, **k: None
+        _r.state_save = lambda *a, **k: None
+        _r.log_line = lambda *a, **k: None
+        try:
+            _j, _m, _e = _r._try_provider(
+                {"name": "fakeprov", "base_url": "http://127.0.0.1:1/v1", "api_key": "k",
+                 "model_map": {"auto": ["m1"]}, "timeout": 5},
+                "auto", [{"role": "user", "content": "hi"}], None, 60)
+        finally:
+            (_r.opener_for, _r._retry_truncated, _r.mark_fail, _r.set_cooldown,
+             _r.state_save, _r.log_line) = _orig
+        check("12. 截断空内容自动重试",
+              _j is not None and _seen.get("called") == ("m1", 60) and _m == "m1",
+              f"重试被调用={_seen.get('called')} 采纳结果={_j is not None} model={_m}")
+    except Exception as e:
+        check("12. 截断空内容自动重试", False, f"{type(e).__name__}: {str(e)[:70]}")
+
+    # 13. tool_calls 非流式（报告·下一步建议 第 1 条）
+    #     补 function calling 之前，shim 只做纯对话，Claude 无法被当 Agent 驱动，
+    #     也就接不进 Claude Code CLI / Cline / Continue 这些真正吃 tool_calls 的客户端。
+    #     覆盖点：tools[].function.parameters 映射成 functionDeclarations、
+    #     parts[].functionCall 反向转成 finish_reason=tool_calls + tool_calls[]。
+    _TOOLS = [{"type": "function", "function": {
+        "name": "get_weather", "description": "查询指定城市的当前天气",
+        "parameters": {"type": "object", "$schema": "http://json-schema.org/draft-07/schema#",
+                       "additionalProperties": False,
+                       "properties": {"city": {"type": "string", "description": "城市名"}},
+                       "required": ["city"]}}}]
+    _tc_model, _tc1, _tc_err = None, None, ""
+    for _m13 in ("antigravity:claude-sonnet-4-6", "antigravity:auto", "amd:auto"):
+        s, b, h = post("/v1/chat/completions",
+                       {"model": _m13, "max_tokens": 300, "tools": _TOOLS,
+                        "messages": [{"role": "user", "content": "北京天气如何？用工具查。"}]})
+        if s == 200:
+            try:
+                _c = json.loads(b)["choices"][0]
+                if (_c.get("message") or {}).get("tool_calls"):
+                    _tc_model, _tc1 = _m13, _c
+                    break
+            except Exception as e:
+                _tc_err = str(e)[:60]
+        else:
+            _tc_err = f"HTTP {s} {b[:80]}"
+    _tc_name = ((((_tc1 or {}).get("message") or {}).get("tool_calls") or [{}])[0]
+                .get("function") or {}).get("name")
+    check("13. tool_calls 非流式",
+          _tc1 is not None and _tc1.get("finish_reason") == "tool_calls" and _tc_name == "get_weather",
+          f"model={_tc_model} finish={(_tc1 or {}).get('finish_reason')} tool={_tc_name} {_tc_err}")
+
+    # 14. tool_calls 多轮闭环：tool_call -> 回传工具结果 -> 最终回答
+    #     这一条才是 Agent 真正跑得起来的分水岭：缺 id 会让上游报
+    #     `messages.N.content.M.tool_use.id: Field required`（实测踩过）。
+    _tc2, _tc2_err = None, ""
+    if _tc1 is not None:
+        _call = ((_tc1.get("message") or {}).get("tool_calls") or [{}])[0]
+        s, b, h = post("/v1/chat/completions",
+                       {"model": _tc_model, "max_tokens": 400, "tools": _TOOLS,
+                        "messages": [
+                            {"role": "user", "content": "北京天气如何？用工具查。"},
+                            {"role": "assistant", "content": (_tc1.get("message") or {}).get("content"),
+                             "tool_calls": [_call]},
+                            {"role": "tool", "tool_call_id": _call.get("id"), "name": "get_weather",
+                             "content": json.dumps({"city": "北京", "temp_c": 21, "weather": "晴"},
+                                                   ensure_ascii=False)}]})
+        if s == 200:
+            try:
+                _tc2 = json.loads(b)["choices"][0]
+            except Exception as e:
+                _tc2_err = str(e)[:60]
+        else:
+            _tc2_err = f"HTTP {s} {b[:80]}"
+    _final = ((_tc2 or {}).get("message") or {}).get("content") or ""
+    check("14. tool_calls 多轮闭环",
+          bool(_final.strip()) and (_tc2 or {}).get("finish_reason") == "stop",
+          f"finish={(_tc2 or {}).get('finish_reason')} 回答长度={len(_final)} {_tc2_err}")
 
     print("=" * 68)
     passed = sum(1 for _, c, _ in results if c)

@@ -378,6 +378,47 @@ def should_failover(status_code, body):
 
 _ACCOUNT_WAIT = 3.0  # 同 provider 内等待可用账号的预算（秒）；超时即交给上层切源
 
+def _retry_truncated(p, real_model, use_key, messages, tools, max_tokens, extra, timeout, want_model):
+    """finish_reason=length 且内容为空时的补救：放宽 max_tokens 重发一次。
+
+    成因：推理模型把输出预算全花在 reasoning 上，正文一个字都没吐出来，
+    客户端拿到空内容，任务就断在那儿（压力测试里 43 次 bigmodel 都栽在这）。
+    直接判失败切源会白白烧掉一个源的冷却和一次额度；先按同源放宽预算重试，
+    通常一次就能出正文。仍失败才返回 None，交给上层走原有的失败/切源逻辑。
+    """
+    base = int(max_tokens or 0) or 1024
+    mt = min(8192, max(base * 2, 2048))
+    if want_model == "vision":
+        mt = min(mt, 1024)
+    payload = {"model": real_model, "messages": messages}
+    if tools:
+        payload["tools"] = tools
+        payload["tool_choice"] = "auto"
+    payload["max_tokens"] = mt
+    if extra:
+        for k, v in extra.items():
+            if k not in payload:
+                payload[k] = v
+    url = p["base_url"].rstrip("/") + "/chat/completions"
+    rq = urllib.request.Request(url, data=json.dumps(payload).encode("utf-8"), method="POST")
+    rq.add_header("Content-Type", "application/json")
+    rq.add_header("Authorization", "Bearer " + use_key)
+    try:
+        with opener_for(p).open(rq, timeout=timeout) as resp:
+            j = json.loads(resp.read().decode("utf-8"))
+    except Exception as e:
+        log_line(f"RETRY {p['name']}/{real_model} 截断重试失败: {type(e).__name__} {e}")
+        return None
+    ch0 = (j.get("choices") or [{}])[0]
+    msg0 = ch0.get("message", {}) or {}
+    c = msg0.get("content")
+    if (c is None or (isinstance(c, str) and not c.strip())) and not msg0.get("tool_calls"):
+        log_line(f"RETRY {p['name']}/{real_model} 放宽后仍空 (finish={ch0.get('finish_reason')}, max_tokens={mt})")
+        return None
+    log_line(f"RETRY {p['name']}/{real_model} 截断空内容 -> max_tokens {base}->{mt} 成功")
+    return j
+
+
 def _try_provider(p, want_model, messages, tools=None, max_tokens=None, extra=None, force=False):
     """对单个 provider 按候选模型依次尝试（从上次成功下标开始绕一圈）。
     成功返回 (j, real_model, None)；全部失败返回 (None, None, last_err)。
@@ -418,6 +459,7 @@ def _try_provider(p, want_model, messages, tools=None, max_tokens=None, extra=No
         switch_account = False
         try:
             for real_model in order:
+                retry_done = False   # 每个候选模型各给一次「截断空内容」补救机会
                 url = p["base_url"].rstrip("/") + "/chat/completions"
                 payload = {"model": real_model, "messages": messages}
                 if tools:
@@ -445,9 +487,23 @@ def _try_provider(p, want_model, messages, tools=None, max_tokens=None, extra=No
                     ch0 = (j.get("choices") or [{}])[0]
                     msg0 = ch0.get("message", {}) or {}
                     content = msg0.get("content")
+                    fr = ch0.get("finish_reason")
                     if (content is None or (isinstance(content, str) and not content.strip())) \
                             and not msg0.get("tool_calls"):
-                        last_err = f"{p['name']} empty content (model={real_model}, finish={ch0.get('finish_reason')})"
+                        # 被 max_tokens 掐断导致空内容（推理模型把预算全耗在思考上）：
+                        # 先在同源放宽输出预算重试一次，成功就直接用，别白烧一次冷却和额度。
+                        # 见打卡·下一步行动第 1 条。vision 上限固定 1024，重试无意义，跳过。
+                        if fr == "length" and not retry_done and want_model != "vision":
+                            retry_done = True
+                            j2 = _retry_truncated(p, real_model, use_key, messages, tools,
+                                                  max_tokens, extra, timeout, want_model)
+                            if j2 is not None:
+                                state_save(p["name"], want_model, cands.index(real_model))
+                                reset_rate_fail(p["name"])
+                                if acct:
+                                    acct.on_success(time.monotonic() - t0)
+                                return j2, real_model, None
+                        last_err = f"{p['name']} empty content (model={real_model}, finish={fr})"
                         log_line("FAIL " + last_err); mark_fail(p["name"], last_err)
                         set_cooldown(p["name"], 20, "empty content")
                         continue
@@ -609,6 +665,7 @@ def chat_call(messages, tools=None, model="auto", max_tokens=None, require_expli
     is_vision = real_want == "vision" or model == "vision"
     est = estimate_input_tokens(messages, tools) + int(max_tokens or 0)
     skipped = []
+    oversize = None
 
     # 上下文窗口感知：跳过窗口装不下本次请求的源（如 bigmodel 16k 上限）
     # 注意：vision 请求也必须过滤。曾经这里写成 `not is_vision`，导致「长对话 + 截图」的请求
@@ -616,14 +673,25 @@ def chat_call(messages, tools=None, model="auto", max_tokens=None, require_expli
     # est 里图片只按固定 1200 token 计，所以正常识图请求不会被误杀。
     if not force:
         fitted = []
+        max_cw = 0
         for p in providers:
             cw = p.get("context_window")
+            if cw:
+                max_cw = max(max_cw, cw)
             if cw and est > cw:
                 skipped.append(f"{p['name']}(ctx {cw}<~{est})")
             else:
                 fitted.append(p)
         if fitted:
             providers = fitted
+        else:
+            # 所有源都装不下。旧逻辑是 `if fitted:` 失效后原样放行，于是超长请求被挨个砸进
+            # 16k 窗口的 bigmodel，白撞 400 + 白等 N 轮往返（压力测试里 55 次超窗 400 都这么来的）。
+            # 现在只挑窗口最大的那一个试一次：估计值偏保守时还能救回来，真装不下也会快速返回明确错误。
+            biggest = max(providers, key=lambda x: x.get("context_window") or 0)
+            log_line(f"route: 无源可装 ~{est}tok (最大窗口 {max_cw})，只试 {biggest['name']}")
+            providers = [biggest]
+            oversize = (est, max_cw)
 
     # 熔断冷却：auto 路由跳过冷却中的源；显式 provider:model 仍尊重用户指定
     if not force:
@@ -659,6 +727,11 @@ def chat_call(messages, tools=None, model="auto", max_tokens=None, require_expli
         if j is not None:
             record_usage("local-ocr", "rapidocr-local", j)
             return j, "local-ocr", None
+    if oversize and last_err:
+        # 把所有源都装不下这件事讲清楚，客户端才知道该拆请求，而不是看到一个无信息量的 429/400。
+        last_err = (f"request too large: ~{oversize[0]} tokens exceeds every provider's "
+                    f"context window (largest {oversize[1]}); 请拆分请求或调小 max_tokens。"
+                    f" 最后一次尝试: {last_err}")
     return None, None, last_err
 
 def log_line(msg):
