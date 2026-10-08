@@ -361,6 +361,11 @@ SLA 保障的线上任务**"。所以**不要给魔搭账号配 `max_concurrency
 4. **国家超算 Key 创建时选"通用"服务类型**，不要买套餐（套餐 Key 接网关会被判按量计费扣钱）。
 5. **同源多账号要用不同的 `name`**（如 `sensenova` / `sensenova2`）。
    冷却按 `name` 生效，同名会让一个账号 429 冻住全部。
+6. **`context_window` 必须按实测校准，别信规格**（2026-10-08 实测）：amd 的
+   `context_window` 配置曾写 `1000000`，但**实测最大输入只有 437504**；且**同一源内不同模型上限不同**——
+   `DeepSeek-V4-Flash` 能到 43 万，`Qwen3.8-*` 却卡 `262144`。配置写大了会高估容量，把超长请求
+   砸进容量小的模型上白撞 `400`。**看 `logs/usage.log` 里该源 `in` 的最大值，比规格可信**；
+   还要注意路由的「上下文窗口过滤」会跳过装不下的源，**诊断超长 400 看 `logs/router_out.log` 的 `route ~Ntok skip:` 行**。
 
 > 入口地址来源：各平台官方站点与控制台（NVIDIA build.nvidia.com、ModelScope、
 > 国家超算互联网 OpenAPI 文档、阿里云百炼控制台、商汤开放平台、阶跃星辰、AMD Radeon Cloud、

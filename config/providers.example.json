@@ -129,7 +129,7 @@
       "name": "amd",
       "enabled": true,
       "priority": 4,
-      "context_window": 1000000,
+      "context_window": 437504,
       "timeout": 60,
       "base_url": "https://developer.amd.com.cn/radeon/api/v1",
       "api_key": "REPLACE_ME",
@@ -164,7 +164,7 @@
         "DeepSeek-V4.1-Flash": "DeepSeek-V4.1-Flash",
         "Qwen3.8-27B": "Qwen3.8-27B"
       },
-      "_note": "AMD Radeon Cloud 免费(Beta)，国内直连、免绑卡；DeepSeek-V4-Flash 文本1M上下文实测2.1s；视觉 vision 候选列表以 DeepSeek-V4-Flash-Vision-Exp 为主(4.5s,1M)，Qwen3.8-27B 小字更准但8.7s略慢；模型清单 Beta 会变，以 GET /v1/models 为准（2026-09-28 实测 9 个）；免费端点不提供 /v1/responses(404)，router 上游走 chat/completions。已排除 MiniCPM5-2B（泄漏 </think> 标签，实测复现）、MinerU2.5-Pro（不支持 tools）。| 2026-09-28 接入第二个 AMD 账号（accounts[] 里 AMD2，与 AMD1 是不同 AMD 账号，额度/并发各自独立；同机仍受「每 IP 120 RPM」总量约束，故每个账号 max_concurrency=4）。新账号额外提供 DeepSeek-V4.1-Flash 与 GLM-5.3-Flash，已补入 auto/vision 候选。",
+      "_note": "AMD Radeon Cloud 免费(Beta)，国内直连、免绑卡；DeepSeek-V4-Flash 文本1M上下文实测2.1s；视觉 vision 候选列表以 DeepSeek-V4-Flash-Vision-Exp 为主(4.5s,1M)，Qwen3.8-27B 小字更准但8.7s略慢；模型清单 Beta 会变，以 GET /v1/models 为准（2026-09-28 实测 9 个）；免费端点不提供 /v1/responses(404)，router 上游走 chat/completions。已排除 MiniCPM5-2B（泄漏 </think> 标签，实测复现）、MinerU2.5-Pro（不支持 tools）。| 2026-09-28 接入第二个 AMD 账号（accounts[] 里 AMD2，与 AMD1 是不同 AMD 账号，额度/并发各自独立；同机仍受「每 IP 120 RPM」总量约束，故每个账号 max_concurrency=4）。新账号额外提供 DeepSeek-V4.1-Flash 与 GLM-5.3-Flash，已补入 auto/vision 候选。 | 2026-10-08 实测校准: context_window 由 1000000 下调为 437504（amd 实际最大输入 in_max=437504；DeepSeek-V4-Flash 能到 43 万，但 Qwen3.8-* 卡 262144，同一源内模型上限不同）。配置写 1000000 会高估容量，把超长请求砸进仅 26 万的 Qwen 上白撞 400。",
       "accounts": [
         {
           "name": "AMD1",
